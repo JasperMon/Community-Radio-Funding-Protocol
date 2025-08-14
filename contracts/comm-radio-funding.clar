@@ -9,6 +9,8 @@
 (define-constant err-campaign-not-active (err u107))
 (define-constant err-campaign-exists (err u108))
 (define-constant err-invalid-duration (err u109))
+(define-constant err-invalid-rating (err u110))
+(define-constant err-already-rated (err u111))
 
 (define-data-var next-station-id uint u1)
 (define-data-var next-campaign-id uint u1)
@@ -69,6 +71,20 @@
   { station-ids: (list 50 uint) }
 )
 
+(define-map station-ratings
+  { station-id: uint, rater: principal }
+  { rating: uint, block-height: uint }
+)
+
+(define-map station-reputation
+  { station-id: uint }
+  { 
+    total-rating: uint,
+    rating-count: uint,
+    average-rating: uint
+  }
+)
+
 (define-read-only (get-station (station-id uint))
   (map-get? stations { station-id: station-id })
 )
@@ -116,6 +132,19 @@
     )
     false
   )
+)
+
+(define-read-only (get-station-rating (station-id uint) (rater principal))
+  (map-get? station-ratings { station-id: station-id, rater: rater })
+)
+
+(define-read-only (get-station-reputation (station-id uint))
+  (default-to { total-rating: u0, rating-count: u0, average-rating: u0 } 
+    (map-get? station-reputation { station-id: station-id }))
+)
+
+(define-read-only (get-station-average-rating (station-id uint))
+  (get average-rating (get-station-reputation station-id))
 )
 
 (define-public (register-station (name (string-ascii 64)) (description (string-ascii 256)) (location (string-ascii 64)))
@@ -357,6 +386,44 @@
     (map-set stations
       { station-id: station-id }
       (merge station-data { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (rate-station (station-id uint) (rating uint))
+  (let
+    (
+      (station-data (unwrap! (get-station station-id) err-not-found))
+      (current-block stacks-block-height)
+      (existing-rating (get-station-rating station-id tx-sender))
+      (current-reputation (get-station-reputation station-id))
+      (current-total (get total-rating current-reputation))
+      (current-count (get rating-count current-reputation))
+    )
+    (asserts! (get is-active station-data) err-station-not-active)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (is-none existing-rating) err-already-rated)
+    
+    (map-set station-ratings
+      { station-id: station-id, rater: tx-sender }
+      { rating: rating, block-height: current-block }
+    )
+    
+    (let 
+      (
+        (new-total (+ current-total rating))
+        (new-count (+ current-count u1))
+        (new-average (/ (* new-total u100) new-count))
+      )
+      (map-set station-reputation
+        { station-id: station-id }
+        {
+          total-rating: new-total,
+          rating-count: new-count,
+          average-rating: new-average
+        }
+      )
     )
     (ok true)
   )
