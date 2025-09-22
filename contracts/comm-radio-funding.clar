@@ -11,6 +11,9 @@
 (define-constant err-invalid-duration (err u109))
 (define-constant err-invalid-rating (err u110))
 (define-constant err-already-rated (err u111))
+(define-constant err-pool-exists (err u112))
+(define-constant err-pool-not-found (err u113))
+(define-constant err-invalid-rate (err u114))
 
 (define-data-var next-station-id uint u1)
 (define-data-var next-campaign-id uint u1)
@@ -66,6 +69,23 @@
   { amount: uint, block-height: uint }
 )
 
+(define-map matching-pools
+  { campaign-id: uint }
+  {
+    sponsor: principal,
+    rate: uint,
+    cap: uint,
+    remaining: uint,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-map campaign-match-stats
+  { campaign-id: uint }
+  { total-matched: uint }
+)
+
 (define-map patron-stations
   { patron: principal }
   { station-ids: (list 50 uint) }
@@ -95,6 +115,14 @@
 
 (define-read-only (get-campaign (campaign-id uint))
   (map-get? campaigns { campaign-id: campaign-id })
+)
+
+(define-read-only (get-matching-pool (campaign-id uint))
+  (map-get? matching-pools { campaign-id: campaign-id })
+)
+
+(define-read-only (get-campaign-match-stats (campaign-id uint))
+  (default-to { total-matched: u0 } (map-get? campaign-match-stats { campaign-id: campaign-id }))
 )
 
 (define-read-only (get-station-by-owner (owner principal))
@@ -290,6 +318,12 @@
       (platform-fee (calculate-platform-fee amount))
       (contribution-amount (- amount platform-fee))
       (existing-contribution (map-get? campaign-contributions { campaign-id: campaign-id, contributor: tx-sender }))
+      (pool (get-matching-pool campaign-id))
+      (pool-active (and (is-some pool) (get active (unwrap-panic pool))))
+      (pool-remaining (if pool-active (get remaining (unwrap-panic pool)) u0))
+      (pool-rate (if pool-active (get rate (unwrap-panic pool)) u0))
+      (raw-match (/ (* contribution-amount pool-rate) u10000))
+      (match-amount (if pool-active (if (> raw-match pool-remaining) pool-remaining raw-match) u0))
     )
     (asserts! (is-campaign-active campaign-id) err-campaign-not-active)
     (asserts! (> amount u0) err-invalid-amount)
@@ -310,7 +344,26 @@
     
     (map-set campaigns
       { campaign-id: campaign-id }
-      (merge campaign-data { raised-amount: (+ (get raised-amount campaign-data) contribution-amount) })
+      (merge campaign-data { raised-amount: (+ (get raised-amount campaign-data) contribution-amount match-amount) })
+    )
+    
+    (if pool-active
+      (begin
+        (let ((pool-data (unwrap-panic pool)))
+          (map-set matching-pools
+            { campaign-id: campaign-id }
+            (merge pool-data { remaining: (- (get remaining pool-data) match-amount) })
+          )
+        )
+        (let ((stats (get-campaign-match-stats campaign-id)))
+          (map-set campaign-match-stats
+            { campaign-id: campaign-id }
+            { total-matched: (+ (get total-matched stats) match-amount) }
+          )
+        )
+        true
+      )
+      true
     )
     (ok true)
   )
@@ -355,6 +408,66 @@
       (merge campaign-data { raised-amount: u0, is-active: false })
     )
     (ok withdrawal-amount)
+  )
+)
+
+(define-public (create-matching-pool (campaign-id uint) (rate uint) (cap uint))
+  (let
+    (
+      (campaign-data (unwrap! (get-campaign campaign-id) err-not-found))
+      (existing (get-matching-pool campaign-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator campaign-data)) err-unauthorized)
+    (asserts! (is-campaign-active campaign-id) err-campaign-not-active)
+    (asserts! (is-none existing) err-pool-exists)
+    (asserts! (and (> rate u0) (<= rate u10000)) err-invalid-rate)
+    (asserts! (> cap u0) err-invalid-amount)
+    
+    (try! (stx-transfer? cap tx-sender (as-contract tx-sender)))
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      { sponsor: tx-sender, rate: rate, cap: cap, remaining: cap, active: true, created-at: current-block }
+    )
+    (map-set campaign-match-stats { campaign-id: campaign-id } { total-matched: u0 })
+    (ok true)
+  )
+)
+
+(define-public (deactivate-matching-pool (campaign-id uint))
+  (let
+    (
+      (pool (unwrap! (get-matching-pool campaign-id) err-pool-not-found))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) err-unauthorized)
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (refund-matching-pool (campaign-id uint))
+  (let
+    (
+      (pool (unwrap! (get-matching-pool campaign-id) err-pool-not-found))
+      (campaign-data (unwrap! (get-campaign campaign-id) err-not-found))
+      (current-block stacks-block-height)
+      (remaining (get remaining pool))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) err-unauthorized)
+    (asserts! (or (not (get active pool)) (> current-block (get end-block campaign-data))) err-campaign-not-active)
+    (asserts! (> remaining u0) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? remaining tx-sender (get sponsor pool))))
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool { remaining: u0, active: false })
+    )
+    (ok remaining)
   )
 )
 
