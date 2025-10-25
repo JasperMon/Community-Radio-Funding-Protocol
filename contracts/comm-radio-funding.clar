@@ -14,6 +14,10 @@
 (define-constant err-pool-exists (err u112))
 (define-constant err-pool-not-found (err u113))
 (define-constant err-invalid-rate (err u114))
+(define-constant err-milestone-not-found (err u115))
+(define-constant err-milestone-already-claimed (err u116))
+(define-constant err-target-not-reached (err u117))
+(define-constant err-invalid-milestone (err u118))
 
 (define-data-var next-station-id uint u1)
 (define-data-var next-campaign-id uint u1)
@@ -105,6 +109,21 @@
   }
 )
 
+(define-map campaign-milestones
+  { campaign-id: uint, milestone-index: uint }
+  {
+    target-percentage: uint,
+    description: (string-ascii 128),
+    is-claimed: bool,
+    claimed-at: (optional uint)
+  }
+)
+
+(define-map campaign-milestone-count
+  { campaign-id: uint }
+  { count: uint }
+)
+
 (define-read-only (get-station (station-id uint))
   (map-get? stations { station-id: station-id })
 )
@@ -173,6 +192,26 @@
 
 (define-read-only (get-station-average-rating (station-id uint))
   (get average-rating (get-station-reputation station-id))
+)
+
+(define-read-only (get-campaign-milestone (campaign-id uint) (milestone-index uint))
+  (map-get? campaign-milestones { campaign-id: campaign-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-milestone-count (campaign-id uint))
+  (default-to { count: u0 } (map-get? campaign-milestone-count { campaign-id: campaign-id }))
+)
+
+(define-read-only (calculate-milestone-target (campaign-id uint) (milestone-index uint))
+  (match (get-campaign campaign-id)
+    campaign-data
+    (match (get-campaign-milestone campaign-id milestone-index)
+      milestone-data
+      (some (/ (* (get target-amount campaign-data) (get target-percentage milestone-data)) u100))
+      none
+    )
+    none
+  )
 )
 
 (define-public (register-station (name (string-ascii 64)) (description (string-ascii 256)) (location (string-ascii 64)))
@@ -539,5 +578,70 @@
       )
     )
     (ok true)
+  )
+)
+
+(define-public (create-campaign-milestone (campaign-id uint) (target-percentage uint) (description (string-ascii 128)))
+  (let
+    (
+      (campaign-data (unwrap! (get-campaign campaign-id) err-not-found))
+      (milestone-count-data (get-milestone-count campaign-id))
+      (current-count (get count milestone-count-data))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator campaign-data)) err-unauthorized)
+    (asserts! (is-campaign-active campaign-id) err-campaign-not-active)
+    (asserts! (and (> target-percentage u0) (<= target-percentage u100)) err-invalid-milestone)
+    
+    (map-set campaign-milestones
+      { campaign-id: campaign-id, milestone-index: current-count }
+      {
+        target-percentage: target-percentage,
+        description: description,
+        is-claimed: false,
+        claimed-at: none
+      }
+    )
+    
+    (map-set campaign-milestone-count
+      { campaign-id: campaign-id }
+      { count: (+ current-count u1) }
+    )
+    (ok current-count)
+  )
+)
+
+(define-public (claim-milestone-funds (campaign-id uint) (milestone-index uint))
+  (let
+    (
+      (campaign-data (unwrap! (get-campaign campaign-id) err-not-found))
+      (station-data (unwrap! (get-station (get station-id campaign-data)) err-not-found))
+      (milestone-data (unwrap! (get-campaign-milestone campaign-id milestone-index) err-milestone-not-found))
+      (milestone-target (unwrap! (calculate-milestone-target campaign-id milestone-index) err-milestone-not-found))
+      (current-block stacks-block-height)
+      (raised (get raised-amount campaign-data))
+      (station-owner (get owner station-data))
+    )
+    (asserts! (is-eq tx-sender (get creator campaign-data)) err-unauthorized)
+    (asserts! (not (get is-claimed milestone-data)) err-milestone-already-claimed)
+    (asserts! (>= raised milestone-target) err-target-not-reached)
+    
+    (let
+      (
+        (withdrawal-amount (/ (* raised (get target-percentage milestone-data)) u100))
+      )
+      (try! (as-contract (stx-transfer? withdrawal-amount tx-sender station-owner)))
+      
+      (map-set campaign-milestones
+        { campaign-id: campaign-id, milestone-index: milestone-index }
+        (merge milestone-data { is-claimed: true, claimed-at: (some current-block) })
+      )
+      
+      (map-set campaigns
+        { campaign-id: campaign-id }
+        (merge campaign-data { raised-amount: (- raised withdrawal-amount) })
+      )
+      (ok withdrawal-amount)
+    )
   )
 )
