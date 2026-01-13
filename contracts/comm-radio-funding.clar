@@ -18,11 +18,16 @@
 (define-constant err-milestone-already-claimed (err u116))
 (define-constant err-target-not-reached (err u117))
 (define-constant err-invalid-milestone (err u118))
+(define-constant err-pledge-exists (err u119))
+(define-constant err-pledge-not-found (err u120))
+(define-constant err-pledge-not-due (err u121))
+(define-constant err-pledge-inactive (err u122))
 
 (define-data-var next-station-id uint u1)
 (define-data-var next-campaign-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var min-subscription-amount uint u1000000)
+(define-data-var pledge-interval-blocks uint u4320)
 
 (define-map stations
   { station-id: uint }
@@ -124,6 +129,27 @@
   { count: uint }
 )
 
+(define-map recurring-pledges
+  { patron: principal, station-id: uint }
+  {
+    amount: uint,
+    interval-blocks: uint,
+    last-executed: uint,
+    total-pledged: uint,
+    execution-count: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map station-pledge-stats
+  { station-id: uint }
+  {
+    total-pledgers: uint,
+    total-recurring-amount: uint
+  }
+)
+
 (define-read-only (get-station (station-id uint))
   (map-get? stations { station-id: station-id })
 )
@@ -200,6 +226,28 @@
 
 (define-read-only (get-milestone-count (campaign-id uint))
   (default-to { count: u0 } (map-get? campaign-milestone-count { campaign-id: campaign-id }))
+)
+
+(define-read-only (get-recurring-pledge (patron principal) (station-id uint))
+  (map-get? recurring-pledges { patron: patron, station-id: station-id })
+)
+
+(define-read-only (get-station-pledge-stats (station-id uint))
+  (default-to { total-pledgers: u0, total-recurring-amount: u0 }
+    (map-get? station-pledge-stats { station-id: station-id }))
+)
+
+(define-read-only (get-pledge-interval)
+  (var-get pledge-interval-blocks)
+)
+
+(define-read-only (is-pledge-due (patron principal) (station-id uint))
+  (match (get-recurring-pledge patron station-id)
+    pledge-data
+    (let ((blocks-since-last (- stacks-block-height (get last-executed pledge-data))))
+      (and (get is-active pledge-data) (>= blocks-since-last (get interval-blocks pledge-data))))
+    false
+  )
 )
 
 (define-read-only (calculate-milestone-target (campaign-id uint) (milestone-index uint))
@@ -643,5 +691,134 @@
       )
       (ok withdrawal-amount)
     )
+  )
+)
+
+(define-public (create-recurring-pledge (station-id uint) (amount uint) (interval-blocks uint))
+  (let
+    (
+      (station-data (unwrap! (get-station station-id) err-not-found))
+      (current-block stacks-block-height)
+      (existing-pledge (get-recurring-pledge tx-sender station-id))
+      (stats (get-station-pledge-stats station-id))
+    )
+    (asserts! (get is-active station-data) err-station-not-active)
+    (asserts! (is-none existing-pledge) err-pledge-exists)
+    (asserts! (>= amount (var-get min-subscription-amount)) err-invalid-amount)
+    (asserts! (>= interval-blocks (var-get pledge-interval-blocks)) err-invalid-duration)
+    
+    (map-set recurring-pledges
+      { patron: tx-sender, station-id: station-id }
+      {
+        amount: amount,
+        interval-blocks: interval-blocks,
+        last-executed: current-block,
+        total-pledged: u0,
+        execution-count: u0,
+        is-active: true,
+        created-at: current-block
+      }
+    )
+    
+    (map-set station-pledge-stats
+      { station-id: station-id }
+      {
+        total-pledgers: (+ (get total-pledgers stats) u1),
+        total-recurring-amount: (+ (get total-recurring-amount stats) amount)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-recurring-pledge (station-id uint))
+  (let
+    (
+      (pledge-data (unwrap! (get-recurring-pledge tx-sender station-id) err-pledge-not-found))
+      (station-data (unwrap! (get-station station-id) err-not-found))
+      (current-block stacks-block-height)
+      (blocks-since-last (- current-block (get last-executed pledge-data)))
+      (platform-fee (calculate-platform-fee (get amount pledge-data)))
+      (station-amount (- (get amount pledge-data) platform-fee))
+    )
+    (asserts! (get is-active pledge-data) err-pledge-inactive)
+    (asserts! (get is-active station-data) err-station-not-active)
+    (asserts! (>= blocks-since-last (get interval-blocks pledge-data)) err-pledge-not-due)
+    
+    (try! (stx-transfer? (get amount pledge-data) tx-sender (as-contract tx-sender)))
+    
+    (map-set recurring-pledges
+      { patron: tx-sender, station-id: station-id }
+      (merge pledge-data {
+        last-executed: current-block,
+        total-pledged: (+ (get total-pledged pledge-data) (get amount pledge-data)),
+        execution-count: (+ (get execution-count pledge-data) u1)
+      })
+    )
+    
+    (map-set stations
+      { station-id: station-id }
+      (merge station-data { total-raised: (+ (get total-raised station-data) station-amount) })
+    )
+    (ok (get amount pledge-data))
+  )
+)
+
+(define-public (cancel-recurring-pledge (station-id uint))
+  (let
+    (
+      (pledge-data (unwrap! (get-recurring-pledge tx-sender station-id) err-pledge-not-found))
+      (stats (get-station-pledge-stats station-id))
+    )
+    (asserts! (get is-active pledge-data) err-pledge-inactive)
+    
+    (map-set recurring-pledges
+      { patron: tx-sender, station-id: station-id }
+      (merge pledge-data { is-active: false })
+    )
+    
+    (map-set station-pledge-stats
+      { station-id: station-id }
+      {
+        total-pledgers: (- (get total-pledgers stats) u1),
+        total-recurring-amount: (- (get total-recurring-amount stats) (get amount pledge-data))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-recurring-pledge (station-id uint) (new-amount uint))
+  (let
+    (
+      (pledge-data (unwrap! (get-recurring-pledge tx-sender station-id) err-pledge-not-found))
+      (stats (get-station-pledge-stats station-id))
+      (old-amount (get amount pledge-data))
+    )
+    (asserts! (get is-active pledge-data) err-pledge-inactive)
+    (asserts! (>= new-amount (var-get min-subscription-amount)) err-invalid-amount)
+    
+    (map-set recurring-pledges
+      { patron: tx-sender, station-id: station-id }
+      (merge pledge-data { amount: new-amount })
+    )
+    
+    (map-set station-pledge-stats
+      { station-id: station-id }
+      {
+        total-pledgers: (get total-pledgers stats),
+        total-recurring-amount: (+ (- (get total-recurring-amount stats) old-amount) new-amount)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-pledge-interval (new-interval uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-interval u0) err-invalid-duration)
+    (var-set pledge-interval-blocks new-interval)
+    (ok true)
   )
 )
